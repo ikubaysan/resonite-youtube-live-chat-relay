@@ -1,10 +1,11 @@
 """
 Sample usage:
 
-  python chat_buffer.py VXNNDRzVMmg
-  python chat_buffer.py VXNNDRzVMmg --max-messages 15
-  python chat_buffer.py VXNNDRzVMmg --max-message-width 120
-  python chat_buffer.py VXNNDRzVMmg --max-messages 20 --max-message-width 80
+  python chat_buffer.py --video-id VXNNDRzVMmg
+  python chat_buffer.py --video-id VXNNDRzVMmg --max-messages 15
+  python chat_buffer.py --video-id VXNNDRzVMmg --max-message-width 120
+  python chat_buffer.py --video-id VXNNDRzVMmg --max-messages 20 --max-message-width 80
+  python chat_buffer.py --video-id VXNNDRzVMmg --max-lines 30
 """
 
 import argparse
@@ -36,11 +37,13 @@ class ChatBuffer:
       - Prints the entire buffer after each accepted message
       - Word-wraps each printed message at `max_message_width` without splitting words when possible
       - Surrounds the buffer with separators at top and bottom
+      - Optionally trims the rendered buffer to `max_lines` lines (from the top)
     """
-    def __init__(self, max_messages: int = 10, max_message_width: int = 100) -> None:
+    def __init__(self, max_messages: int = 10, max_message_width: int = 100, max_lines: int = 0) -> None:
         # Basic safety clamps
         self.max_messages: int = max(1, int(max_messages))
         self.max_message_width: int = max(10, int(max_message_width))
+        self.max_lines: int = max(0, int(max_lines))  # 0 = disabled
 
         self._buffer: Deque[ChatMessage] = deque()
         self._ids: Set[str] = set()
@@ -79,21 +82,26 @@ class ChatBuffer:
         )
 
     def render_buffer(self) -> str:
-        """Return the chat buffer as a formatted string (with separators)."""
-        sep = "-" * self.max_message_width
+        """Return the chat buffer as a formatted string (with separators, possibly trimmed)."""
+        sep_char = "─"  # or "━", "═", "█"
+        sep = sep_char * self.max_message_width
         out_lines: list[str] = [sep]  # top border
         for idx, m in enumerate(self._buffer):
             if idx > 0:  # separator only between messages
                 out_lines.append(sep)
             out_lines.extend(self._wrap(m.formatted_header()))
         out_lines.append(sep)  # bottom border
+
+        # If max_lines is set, trim from the top
+        if self.max_lines > 0 and len(out_lines) > self.max_lines:
+            out_lines = out_lines[-self.max_lines :]
+
         return "\n".join(out_lines)
 
     def print_buffer(self) -> None:
         """Print the rendered chat buffer string."""
         output = self.render_buffer()
         print(output + "\n")  # add an extra newline after printing
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,15 +125,27 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Maximum characters per printed line (default: 100)."
     )
+    parser.add_argument(
+        "--max-lines",
+        type=int,
+        default=0,
+        help=(
+            "Maximum number of lines to show in the rendered buffer. "
+            "If set to 0 (default), this feature is disabled."
+        )
+    )
     return parser.parse_args()
-
 
 
 if __name__ == "__main__":
     args = parse_args()
 
     chat = pytchat.create(video_id=args.video_id)
-    buffer = ChatBuffer(max_messages=args.max_messages, max_message_width=args.max_message_width)
+    buffer = ChatBuffer(
+        max_messages=args.max_messages,
+        max_message_width=args.max_message_width,
+        max_lines=args.max_lines,
+    )
 
     try:
         while chat.is_alive():
