@@ -78,16 +78,22 @@ class ChatBuffer:
             break_on_hyphens=False,
         )
 
-    def print_buffer(self) -> None:
-        sep = "-" * self.max_message_width  # frame width follows message width
+    def render_buffer(self) -> str:
+        """Return the chat buffer as a formatted string (with separators)."""
+        sep = "-" * self.max_message_width
         out_lines: list[str] = [sep]  # top border
         for idx, m in enumerate(self._buffer):
             if idx > 0:  # separator only between messages
                 out_lines.append(sep)
             out_lines.extend(self._wrap(m.formatted_header()))
         out_lines.append(sep)  # bottom border
-        print("\n".join(out_lines))
-        print()  # extra newline after the entire chatbuffer print
+        return "\n".join(out_lines)
+
+    def print_buffer(self) -> None:
+        """Print the rendered chat buffer string."""
+        output = self.render_buffer()
+        print(output + "\n")  # add an extra newline after printing
+
 
 
 def parse_args() -> argparse.Namespace:
