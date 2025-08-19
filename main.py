@@ -6,9 +6,6 @@ from typing import Deque, Set
 import pytchat
 
 
-MAX_WIDTH = 100  # max characters per printed line
-
-
 @dataclass(frozen=True)
 class ChatMessage:
     msg_id: str
@@ -27,10 +24,12 @@ class ChatBuffer:
       - Holds up to `max_messages`
       - Ignores duplicates by message ID in O(1) via a set
       - Prints the entire buffer after each accepted message
-      - Word-wraps each printed message at MAX_WIDTH without splitting words when possible
+      - Word-wraps each printed message at `max_width` without splitting words when possible
+      - Surrounds the buffer with separators at top and bottom
     """
-    def __init__(self, max_messages: int = 10) -> None:
+    def __init__(self, max_messages: int = 10, max_width: int = 100) -> None:
         self.max_messages: int = max_messages
+        self.max_width: int = max_width
         self._buffer: Deque[ChatMessage] = deque()
         self._ids: Set[str] = set()
 
@@ -53,36 +52,38 @@ class ChatBuffer:
 
     def _wrap(self, s: str) -> list[str]:
         """
-        Wrap a string to MAX_WIDTH, preferring not to split words.
-        - Words longer than MAX_WIDTH will be split (to keep the hard max width).
+        Wrap a string to `self.max_width`, preferring not to split words.
+        - Words longer than `self.max_width` will be split (to keep the hard max width).
         - Hyphen-based breaks are disabled to avoid mid-hyphen splits.
         """
         return textwrap.wrap(
             s,
-            width=MAX_WIDTH,
+            width=self.max_width,
             expand_tabs=False,
             replace_whitespace=False,
             drop_whitespace=False,
-            break_long_words=True,     # only splits if a single word exceeds MAX_WIDTH
+            break_long_words=True,     # only splits if a single word exceeds max_width
             break_on_hyphens=False,
         )
 
     def print_buffer(self) -> None:
         sep = "-" * 50
-        out_lines: list[str] = []
-        for m in self._buffer:
-            out_lines.append(sep)
-            for line in self._wrap(m.formatted_header()):
-                out_lines.append(line)
+        out_lines: list[str] = [sep]  # top border
+        for idx, m in enumerate(self._buffer):
+            if idx > 0:  # separator only between messages
+                out_lines.append(sep)
+            out_lines.extend(self._wrap(m.formatted_header()))
+        out_lines.append(sep)  # bottom border
         print("\n".join(out_lines))
-        print("\n\n")  # extra newlines after the entire chatbuffer print
+        print()  # extra newline after the entire chatbuffer print
 
 
 if __name__ == "__main__":
     video_id = "vxNNDRzVMmg"
     chat = pytchat.create(video_id)
 
-    buffer = ChatBuffer(max_messages=10)
+    # Customize max_messages and max_width here
+    buffer = ChatBuffer(max_messages=10, max_width=100)
 
     while chat.is_alive():
         items = chat.get().items
