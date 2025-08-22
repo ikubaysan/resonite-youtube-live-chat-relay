@@ -226,10 +226,17 @@ def parse_args() -> argparse.Namespace:
                         help="Number of separator characters per line (default: 20).")
     parser.add_argument("--retry-wait", type=float, default=15.0,
                         help="Seconds to wait before retrying when chat is not alive (default: 15).")
+    parser.add_argument("--stale-timeout", type=float, default=120.0,
+                        help="If no chat items arrive for this many seconds, recreate the chat client (default: 120).")
     return parser.parse_args()
 
 
 # -------------------- Main (single asyncio loop, no background event loop threads) --------------------
+
+def _create_chat(video_id: str):
+    # Wrap creation to keep a single place for logging and future options
+    print(f"[Chat] Creating new pytchat client for video_id={video_id}", flush=True)
+    return pytchat.create(video_id=video_id)
 
 async def main_async(args: argparse.Namespace) -> None:
     buffer = ChatBuffer(
@@ -240,8 +247,9 @@ async def main_async(args: argparse.Namespace) -> None:
         sep_length=args.sep_length,
     )
 
-    # Create pytchat client (terminates in finally)
-    chat = pytchat.create(video_id=args.video_id)
+    # Create pytchat client (recreated as needed)
+    chat = _create_chat(args.video_id)
+    last_item_ts = time.monotonic()
 
     async def ws_handler(ws: websockets.WebSocketServerProtocol):
         buffer.add_ws_client(ws)
@@ -261,22 +269,35 @@ async def main_async(args: argparse.Namespace) -> None:
     async with websockets.serve(ws_handler, args.ws_host, args.ws_port):
         try:
             while True:
+                # 1) If pytchat reports dead, rebuild it.
                 if not chat.is_alive():
                     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
-                          f"Chat stream at {args.video_id} is not alive. Retrying in {args.retry_wait:.1f} seconds...",
+                          f"Chat stream at {args.video_id} reports NOT ALIVE. Recreating client after {args.retry_wait:.1f}s...",
                           flush=True)
+                    with contextlib.suppress(Exception):
+                        chat.terminate()
                     await interruptible_wait(args.retry_wait)
+                    chat = _create_chat(args.video_id)
+                    # After recreation, continue loop (don’t hammer get() immediately)
+                    await asyncio.sleep(0.1)
                     continue
 
-                # Run chat.get() in a worker thread so the loop stays cancellable
+                # 2) Try reading items; if get() explodes, recreate client.
                 try:
                     items = await asyncio.to_thread(lambda: chat.get().items)
                 except Exception as e:
-                    print(f"[Chat] get() error: {e}. Backing off {args.retry_wait:.1f}s", flush=True)
+                    print(f"[Chat] get() error: {e}. Recreating client after {args.retry_wait:.1f}s", flush=True)
+                    with contextlib.suppress(Exception):
+                        chat.terminate()
                     await interruptible_wait(args.retry_wait)
+                    chat = _create_chat(args.video_id)
+                    await asyncio.sleep(0.1)
                     continue
 
+                # 3) Process items
                 updated = False
+                if items:
+                    last_item_ts = time.monotonic()
                 for item in items:
                     added = buffer.add_message(item.id, item.timestamp, item.author.name, item.message)
                     if added:
@@ -285,6 +306,20 @@ async def main_async(args: argparse.Namespace) -> None:
                 if updated:
                     await buffer.print_and_broadcast()
 
+                # 4) Stale watchdog: if no items for a while, rebuild the client even if is_alive() is True
+                idle = time.monotonic() - last_item_ts
+                if args.stale_timeout > 0 and idle >= args.stale_timeout:
+                    print(f"[Chat] No items for {idle:.0f}s (>= {args.stale_timeout:.0f}). "
+                          f"Assuming stale client; recreating after {args.retry_wait:.1f}s.", flush=True)
+                    with contextlib.suppress(Exception):
+                        chat.terminate()
+                    await interruptible_wait(args.retry_wait)
+                    chat = _create_chat(args.video_id)
+                    last_item_ts = time.monotonic()
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # Small tick to keep loop responsive but not hot
                 await asyncio.sleep(0.01)
 
         finally:
