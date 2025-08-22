@@ -256,7 +256,12 @@ if __name__ == "__main__":
     chat = pytchat.create(video_id=args.video_id)
 
     try:
-        while chat.is_alive():
+        while True:
+            if not chat.is_alive():
+                print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] Chat stream at {args.video_id} is not alive. Retrying in 15 seconds...")
+                time.sleep(15)
+                continue
+
             items = chat.get().items
             for item in items:
                 buffer.add_message(item.id, item.timestamp, item.author.name, item.message)
