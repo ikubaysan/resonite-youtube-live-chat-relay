@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from collections import deque
-from typing import Deque, Set, Optional, Callable
+from typing import Deque, Set, Optional, Callable, Awaitable
 
 import pytchat
 import websockets
@@ -24,15 +24,19 @@ class WebSocketBroadcaster:
         self._clients: Set[websockets.WebSocketServerProtocol] = set()
         self._started = threading.Event()
         self._server_task: Optional[asyncio.Task] = None
-        self.on_connect: Optional[Callable[[], None]] = None  # <— NEW
+        # on_connect will be called with the websocket of the newly connected client.
+        # It can be sync or async. Use it to send per-client messages before any broadcasts.
+        self.on_connect: Optional[Callable[[websockets.WebSocketServerProtocol], Optional[Awaitable[None]]]] = None
 
     async def _handler(self, ws: websockets.WebSocketServerProtocol) -> None:
         self._clients.add(ws)
         try:
-            # Invoke connect hook (non-blocking user logic expected)
-            if self.on_connect:
-                # Safe to call; downstream broadcast uses call_soon_threadsafe
-                self.on_connect()
+            # If provided, allow a hook on connection (can be async or sync)
+            if self.on_connect is not None:
+                result = self.on_connect(ws)
+                if asyncio.iscoroutine(result):
+                    await result  # ensure per-client message is sent before anything else
+
             # Keep connection alive; we don't expect inbound messages
             async for _ in ws:
                 pass
@@ -73,9 +77,11 @@ class WebSocketBroadcaster:
         """Thread-safe schedule of a broadcast from any thread."""
         if self._loop.is_closed():
             return
+        # Prefix all WS broadcasts
+        payload = f"ChatBuffer::{text}"
         self._loop.call_soon_threadsafe(
             asyncio.create_task,
-            self._broadcast(text)
+            self._broadcast(payload)
         )
 
 
@@ -91,6 +97,10 @@ class ChatMessage:
     def formatted_header(self) -> str:
         dt = datetime.datetime.fromtimestamp(self.timestamp_ms / 1000.0)
         return f"{dt:%H:%M:%S} - {self.author}: {self.text}"
+
+    def formatted_header_bold_author(self) -> str:
+        dt = datetime.datetime.fromtimestamp(self.timestamp_ms / 1000.0)
+        return f"{dt:%H:%M:%S} - <b>{self.author}</b>: {self.text}"
 
 
 class ChatBuffer:
@@ -111,12 +121,14 @@ class ChatBuffer:
         max_lines: int = 0,
         broadcaster: Optional[WebSocketBroadcaster] = None,
         sep_char: str = "─",
+        sep_length: int = 100,
     ) -> None:
         # Basic safety clamps
         self.max_messages: int = max(1, int(max_messages))
         self.max_message_width: int = max(10, int(max_message_width))
         self.max_lines: int = max(0, int(max_lines))  # 0 = disabled
         self.sep_char: str = sep_char
+        self.sep_length: int = max(1, int(sep_length))
 
         self._buffer: Deque[ChatMessage] = deque()
         self._ids: Set[str] = set()
@@ -155,14 +167,15 @@ class ChatBuffer:
             break_on_hyphens=False,
         )
 
-    def render_buffer(self) -> str:
+    def render_buffer(self, bold_usernames: bool = False) -> str:
         """Return the chat buffer as a formatted string (with separators, possibly trimmed)."""
-        sep = self.sep_char * self.max_message_width
+        sep = self.sep_char * self.sep_length
         out_lines: list[str] = [sep]  # top border
         for idx, m in enumerate(self._buffer):
             if idx > 0:  # separator only between messages
                 out_lines.append(sep)
-            out_lines.extend(self._wrap(m.formatted_header()))
+            header = m.formatted_header_bold_author() if bold_usernames else m.formatted_header()
+            out_lines.extend(self._wrap(header))
         out_lines.append(sep)  # bottom border
 
         # If max_lines is set, trim from the top
@@ -173,10 +186,13 @@ class ChatBuffer:
 
     def print_buffer(self) -> None:
         """Print the rendered chat buffer string and broadcast it if enabled."""
-        output = self.render_buffer()
-        print(output + "\n")  # print locally
+        # Console (plain usernames)
+        output_plain = self.render_buffer(bold_usernames=False)
+        print(output_plain + "\n")
+        # Websocket (bold usernames)
         if self._broadcaster:
-            self._broadcaster.broadcast(output)  # send raw text over WS
+            output_bold = self.render_buffer(bold_usernames=True)
+            self._broadcaster.broadcast(output_bold)
 
 
 # -------------------- CLI & Main --------------------
@@ -199,6 +215,8 @@ def parse_args() -> argparse.Namespace:
                         help="WebSocket port to bind (default: 17865).")
     parser.add_argument("--sep-char", default="─",
                         help='Separator character (default: "─"). Alternatives: "━", "═", "█", "-".')
+    parser.add_argument("--sep-length", type=int, default=100,
+                        help="Number of separator characters per line (default: 100).")
     return parser.parse_args()
 
 
@@ -215,10 +233,14 @@ if __name__ == "__main__":
         max_lines=args.max_lines,
         broadcaster=broadcaster,
         sep_char=args.sep_char,
+        sep_length=args.sep_length,
     )
 
-    # Wire the on_connect hook to add a "Client Connected" system message and immediately broadcast
-    def _on_connect():
+    # When a client connects:
+    # 1) Send them "Data::<live url>" directly (only to that client)
+    # 2) Then append a "Client Connected" system message to the buffer (broadcasts with ChatBuffer:: prefix)
+    async def _on_connect(ws: websockets.WebSocketServerProtocol):
+        await ws.send(f"Data::https://www.youtube.com/live/{args.video_id}")
         buffer.add_message(
             msg_id=f"sys-{uuid.uuid4().hex}",
             timestamp_ms=int(time.time() * 1000),
