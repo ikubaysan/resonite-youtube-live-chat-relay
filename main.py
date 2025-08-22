@@ -202,9 +202,9 @@ def parse_args() -> argparse.Namespace:
         description="Print and broadcast a rolling, wrapped YouTube Live Chat buffer."
     )
     parser.add_argument("--video-id", required=True, help="YouTube video ID (required).")
-    parser.add_argument("--max-messages", type=int, default=10,
+    parser.add_argument("--max-messages", type=int, default=20,
                         help="Maximum number of chat messages to keep in the buffer (default: 10).")
-    parser.add_argument("--max-message-width", type=int, default=100,
+    parser.add_argument("--max-message-width", type=int, default=50,
                         help="Maximum characters per printed line (default: 100).")
     parser.add_argument("--max-lines", type=int, default=0,
                         help=("Maximum number of lines to show in the rendered buffer (after wrapping & separators). "
@@ -215,7 +215,7 @@ def parse_args() -> argparse.Namespace:
                         help="WebSocket port to bind (default: 17865).")
     parser.add_argument("--sep-char", default="─",
                         help='Separator character (default: "─"). Alternatives: "━", "═", "█", "-".')
-    parser.add_argument("--sep-length", type=int, default=100,
+    parser.add_argument("--sep-length", type=int, default=20,
                         help="Number of separator characters per line (default: 100).")
     return parser.parse_args()
 
