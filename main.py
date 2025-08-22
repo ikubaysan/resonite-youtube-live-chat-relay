@@ -5,6 +5,7 @@ import textwrap
 import threading
 import time
 import uuid
+import contextlib
 from dataclasses import dataclass
 from collections import deque
 from typing import Deque, Set, Optional, Callable, Awaitable
@@ -24,14 +25,11 @@ class WebSocketBroadcaster:
         self._clients: Set[websockets.WebSocketServerProtocol] = set()
         self._started = threading.Event()
         self._server_task: Optional[asyncio.Task] = None
-        # on_connect will be called with the websocket of the newly connected client.
-        # It can be sync or async. Use it to send per-client messages before any broadcasts.
         self.on_connect: Optional[Callable[[websockets.WebSocketServerProtocol], Optional[Awaitable[None]]]] = None
 
     async def _handler(self, ws: websockets.WebSocketServerProtocol) -> None:
         self._clients.add(ws)
         try:
-            # If provided, allow a hook on connection (can be async or sync)
             if self.on_connect is not None:
                 result = self.on_connect(ws)
                 if asyncio.iscoroutine(result):
@@ -46,8 +44,7 @@ class WebSocketBroadcaster:
     async def _serve(self) -> None:
         async with websockets.serve(self._handler, self.host, self.port):
             self._started.set()
-            # Run forever
-            await asyncio.Future()
+            await asyncio.Future()  # run forever
 
     def start(self) -> None:
         def runner():
@@ -57,7 +54,6 @@ class WebSocketBroadcaster:
 
         t = threading.Thread(target=runner, daemon=True)
         t.start()
-        # Wait until server socket is bound
         self._started.wait()
         print(f"[WebSocket] Hosting on ws://{self.host}:{self.port}")
 
@@ -77,12 +73,29 @@ class WebSocketBroadcaster:
         """Thread-safe schedule of a broadcast from any thread."""
         if self._loop.is_closed():
             return
-        # Prefix all WS broadcasts
         payload = f"ChatBuffer::{text}"
         self._loop.call_soon_threadsafe(
             asyncio.create_task,
             self._broadcast(payload)
         )
+
+    def stop(self) -> None:
+        """Best-effort shutdown of the server loop/thread."""
+        if self._loop.is_closed():
+            return
+
+        async def _shutdown():
+            for ws in list(self._clients):
+                with contextlib.suppress(Exception):
+                    await ws.close()
+            # Stop the loop
+            self._loop.stop()
+
+        try:
+            asyncio.run_coroutine_threadsafe(_shutdown(), self._loop).result(timeout=2)
+        except Exception:
+            # If anything goes sideways, at least try to stop the loop
+            self._loop.call_soon_threadsafe(self._loop.stop)
 
 
 # -------------------- Chat Buffer --------------------
@@ -163,7 +176,7 @@ class ChatBuffer:
             expand_tabs=False,
             replace_whitespace=False,
             drop_whitespace=False,
-            break_long_words=True,     # only splits if a single word exceeds max width
+            break_long_words=True,
             break_on_hyphens=False,
         )
 
@@ -178,7 +191,6 @@ class ChatBuffer:
             out_lines.extend(self._wrap(header))
         out_lines.append(sep)  # bottom border
 
-        # If max_lines is set, trim from the top
         if self.max_lines > 0 and len(out_lines) > self.max_lines:
             out_lines = out_lines[-self.max_lines:]
 
@@ -195,6 +207,21 @@ class ChatBuffer:
             self._broadcaster.broadcast(output_bold)
 
 
+# -------------------- Helpers --------------------
+
+def interruptible_wait(seconds: float, step: float = 0.1) -> None:
+    """
+    Sleep in short chunks so Ctrl+C is handled promptly on platforms
+    where a long time.sleep() isn't interrupted immediately.
+    """
+    end = time.monotonic() + max(0.0, seconds)
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(step, remaining))
+
+
 # -------------------- CLI & Main --------------------
 
 def parse_args() -> argparse.Namespace:
@@ -203,9 +230,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video-id", required=True, help="YouTube video ID (required).")
     parser.add_argument("--max-messages", type=int, default=20,
-                        help="Maximum number of chat messages to keep in the buffer (default: 10).")
+                        help="Maximum number of chat messages to keep in the buffer (default: 20).")
     parser.add_argument("--max-message-width", type=int, default=50,
-                        help="Maximum characters per printed line (default: 100).")
+                        help="Maximum characters per printed line (default: 50).")
     parser.add_argument("--max-lines", type=int, default=0,
                         help=("Maximum number of lines to show in the rendered buffer (after wrapping & separators). "
                               "If set to 0 (default), this feature is disabled."))
@@ -216,7 +243,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sep-char", default="─",
                         help='Separator character (default: "─"). Alternatives: "━", "═", "█", "-".')
     parser.add_argument("--sep-length", type=int, default=20,
-                        help="Number of separator characters per line (default: 100).")
+                        help="Number of separator characters per line (default: 20).")
+    parser.add_argument("--retry-wait", type=float, default=15.0,
+                        help="Seconds to wait before retrying when chat is not alive (default: 15).")
     return parser.parse_args()
 
 
@@ -236,9 +265,9 @@ if __name__ == "__main__":
         sep_length=args.sep_length,
     )
 
-    # When a client connects:
-    # 1) Send them "Data::<live url>" directly (only to that client)
-    # 2) Then append a "Client Connected" system message to the buffer (broadcasts with ChatBuffer:: prefix)
+    # On client connect:
+    # 1) DM them "Data::<live url>" directly
+    # 2) Then append a "Client Connected" system message (broadcasts with ChatBuffer:: prefix)
     async def _on_connect(ws: websockets.WebSocketServerProtocol):
         await ws.send(f"Data::https://www.youtube.com/live/{args.video_id}")
         buffer.add_message(
@@ -250,7 +279,7 @@ if __name__ == "__main__":
 
     broadcaster.on_connect = _on_connect
 
-    # Now start the WebSocket server
+    # Start the WebSocket server
     broadcaster.start()
 
     chat = pytchat.create(video_id=args.video_id)
@@ -258,12 +287,16 @@ if __name__ == "__main__":
     try:
         while True:
             if not chat.is_alive():
-                print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] Chat stream at {args.video_id} is not alive. Retrying in 15 seconds...")
-                time.sleep(15)
+                print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] Chat stream at {args.video_id} is not alive. Retrying in {args.retry_wait:.1f} seconds...")
+                interruptible_wait(args.retry_wait)  # responsive sleep
                 continue
 
             items = chat.get().items
             for item in items:
                 buffer.add_message(item.id, item.timestamp, item.author.name, item.message)
     except KeyboardInterrupt:
-        pass
+        print("\n[Main] KeyboardInterrupt received. Shutting down...")
+    finally:
+        with contextlib.suppress(Exception):
+            chat.terminate()  # best-effort close (pytchat)
+        broadcaster.stop()
